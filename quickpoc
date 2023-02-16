@@ -6,8 +6,19 @@ ZERO_ADDRESS=0x0000000000000000000000000000000000000000
 
 # ===== FUNCTIONS ======
 
+printHelp () {
+   echo "Options:"
+   echo -e "-r, --rpc \t\t chain RPC URL."
+   echo -e "-c, --chain \t\t chain name supported by cast."
+   echo -e "-a, --api \t\t endpoint for block explorer API."
+   echo -e "-k, --key \t\t block explorer API key."
+   echo -e "-p, --proxy \t\t storage location for proxy contract if not in default location (keccak256('eip1967.proxy.implementation')) - 1)"
+   echo -e "-o, --output \t\t output folder. Default: current location"
+   echo -e "-h, --help, ? \t\t print this help message"
+}
+
 printUsage () {
-   echo "Usage: $0 <contract-name> [<folder-name>]"
+   echo "Usage: $0 [OPTION]... [CONTRACT-ADDRESS]..."
 }
 
 # param 1 - command to check
@@ -16,6 +27,138 @@ checkCommandExists () {
       echo "Command $1 not found, please install it before using this tool"
       exit 1
    fi
+}
+
+downloadSmartContract () {
+   
+   proxy_storage_value=$(cast storage --rpc-url $RPC_URL --chain $CHAIN -e $BLOCK_EXPLORER_API_KEY $1 $PROXY_STORAGE_LOCATION)   
+   proxy_impl=$(cast --abi-decode "sig()(address)" $proxy_storage_value)
+
+   if [ $proxy_impl == $ZERO_ADDRESS ] ; then
+      logic_contract=$1
+      data_contract=$1
+   else
+      logic_contract=$proxy_impl
+      data_contract=$1
+   fi
+
+   name=$(curl -s --location --request GET "${API_ENDPOINT}?module=contract&action=getsourcecode&address=${logic_contract}&apikey=${BLOCK_EXPLORER_API_KEY}" | jq -r '.result'[0].ContractName)
+
+   if [ -z $2 ]; then
+      folder=${name}
+   else
+      folder="${2}/${name}"
+   fi
+
+   if [ -d ${folder} ]; then
+      echo "error: already folder named $name - enter a custom name as a second arg"
+      exit 1
+   fi
+
+   forge init $folder --no-commit
+   echo "moving to folder in sc generate: " $folder
+   cd $folder
+   rm -rf src
+   rm -rf script
+   
+   cast etherscan-source -c $CHAIN -d src --etherscan-api-key $BLOCK_EXPLORER_API_KEY $logic_contract
+   
+   rm test/Counter.t.sol
+
+   forge remappings > remappings.txt
+   for library in $(ls src/${name})
+   do
+      if [ $library != contracts ]
+      then
+         echo "${library}/=src/${name}/${library}/" >> remappings.txt
+      fi
+   done
+
+   # run slither
+   slither . --checklist --exclude-low --exclude-medium --exclude naming-convention,solc-version,similar-names,name-reused > slither_checklist.md   
+   
+   touch test/${name}POC.t.sol
+
+   cat << EOF >> test/${name}POC.t.sol
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.5.0 <0.9.0;
+
+import "forge-std/Test.sol";
+EOF
+
+   for file in $(find src/${name}/contracts -name '*.sol')
+   do
+      echo "import \"../$file\";" >> test/${name}POC.t.sol
+   done
+
+   for file in $(find src/${name}/ -name '*.sol')
+   do
+      echo "import \"../$file\";" >> test/${name}POC.t.sol
+   done
+
+   cat << EOF >> test/${name}POC.t.sol
+
+// Foundry cheatsheet: https://github.com/foundry-rs/foundry/blob/master/forge/README.md#cheat-codes
+// Foundry doc: https://book.getfoundry.sh
+
+contract ${name}POC is Test {
+
+   ${name} c = ${name}($data_contract);
+   
+   function setUp() public {
+      vm.createSelectFork('${RPC_URL}');
+   }
+
+EOF
+   if [ $proxy_impl == $ZERO_ADDRESS ] ; then
+cat << EOF >> test/${name}POC.t.sol
+   // example test
+   function test${name}POC() public view {
+        assert(address(c) == $data_contract);
+   }
+EOF
+   else
+cat << EOF >> test/${name}POC.t.sol   
+   // test that implementation logic is on expected address
+   function test${name}ExpectedLogicContractOnImplementationSlot() public {
+        bytes32 implementation = vm.load(address(c), $PROXY_STORAGE_LOCATION);
+
+        assertEq(address($logic_contract), address(uint160(uint256(implementation))));
+   }
+EOF
+   fi   
+
+cat << EOF >> test/${name}POC.t.sol
+
+}
+EOF
+
+   # create slither filter
+   touch slither.config.json
+   cat << EOF >> slither.config.json
+{
+    "filter_paths": "test|lib",
+    "compile_force_framework": "foundry"
+}
+EOF
+
+   cd ..
+}
+
+# has to be called after all config is resolved
+# it's assumed that it's called after `downloadSmartContract` function and "name" is set
+function graphSmartContract () {
+   echo "moving to folder in graph generate: " $folder
+   cd $folder
+   mkdir assets
+
+   LIST=$(find src -type f -name '*.sol') # glob expansion doesn't work here in Linux for some reason
+   surya graph $LIST | dot -Tpng > assets/${name}-flow-graph.png
+
+   sol2uml class -n ${CHAIN} -k $BLOCK_EXPLORER_API_KEY -o assets/${name}-UML.svg $logic_contract
+   sol2uml storage -n ${CHAIN} -k $BLOCK_EXPLORER_API_KEY -o assets/${name}-storage.svg $logic_contract
+
+   cd ..
 }
 
 # ====== CHECKS ======
@@ -27,100 +170,89 @@ checkCommandExists curl
 checkCommandExists surya
 checkCommandExists dot
 checkCommandExists sol2uml
+checkCommandExists slither
 
-if [ "${1:0:2}" != "0x" ] ; then #if first 2 chars of $1 (contract name) don't start with "0x", fail
-   printUsage
-   exit 1
-fi
-
-if [ -z "$ETHERSCAN_API_KEY" ]; then
-   echo "Please set ETHERSCAN_API_KEY variable"
-   exit 1
-fi
-
-if [ -z "$ETH_RPC_URL" ]; then
-   echo "Please set ETH_RPC_URL variable"
-   exit 1
-fi
-
-# ====== SETUP POC =====
-
-proxy_impl=$(cast --abi-decode "sig()(address)"  $(cast storage $1 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc))
-
-if [ "$proxy_impl" == "$ZERO_ADDRESS" ] ; then
-   logic_contract=$1
-   data_contract=$1
-else
-   logic_contract=$proxy_impl
-   data_contract=$1
-fi
-
-name=$(curl -s --location --request GET "https://api.etherscan.io/api?module=contract&action=getsourcecode&address=${logic_contract}&apikey=${ETHERSCAN_API_KEY}" | jq -r '.result'[0].ContractName)
-folder=$name
-
-if [ $# -gt 2 ]; then
-    echo "error: max 2 arguments allowed"
-    exit 1
-elif [ $# -eq 2 ]; then
-    folder=$2
-fi
-if [ -d ${folder} ]; then
-    echo "error: already folder named $name - enter a custom name as a second arg"
-    exit 1
-fi
-
-forge init $folder --no-commit
-cd $folder
-rm -rf src
-rm -rf script
-
-cast etherscan-source -d src --etherscan-api-key $ETHERSCAN_API_KEY $logic_contract
-
-forge remappings > remappings.txt
-for library in $(ls src/${name})
-do
-    if [ $library != contracts ]
-        then
-            echo "${library}/=src/${name}/${library}/" >> remappings.txt
-    fi
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -r|--rpc)
+      RPC_URL="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -c|--chain)
+      CHAIN="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -a|--api)
+      API_ENDPOINT="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -k|--key)
+      BLOCK_EXPLORER_API_KEY="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -o|--output)
+      OUTPUT_FOLDER="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -p|--proxy)
+      PROXY_STORAGE_LOCATION="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -h|--help|?)
+      printUsage
+      printHelp
+      exit 0
+      ;;
+    -*|--*)
+      echo "Unknown option $1"
+      exit 1
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1") # save positional arg
+      shift # past argument
+      ;;
+  esac
 done
 
-rm test/Counter.t.sol
-touch test/POC.t.sol
+if [ -z "$RPC_URL" ]; then
+   echo "Please set RPC_URL via -r"
+   exit 1
+fi
 
-cat << EOF >> test/POC.t.sol
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+if [ -z "$CHAIN" ]; then
+   echo "Please set CHAIN via -c"
+   exit 1
+fi
 
-import "forge-std/Test.sol";
-EOF
+if [ -z "$API_ENDPOINT" ]; then
+   echo "Please set API_ENDPOINT via -a"
+   exit 1
+fi
 
-for file in $(find src/${name}/contracts -name '*.sol')
+if [ -z "$BLOCK_EXPLORER_API_KEY" ]; then
+   echo "Please set BLOCK_EXPLORER_API_KEY via -k"
+   exit 1
+fi
+
+if [ -z "$PROXY_STORAGE_LOCATION" ]; then
+   PROXY_STORAGE_LOCATION=0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
+fi
+
+set -- "${POSITIONAL_ARGS[@]}" # restore positional parameters
+
+for CONTRACT in $@
 do
-    echo "import \"../$file\";" >> test/POC.t.sol
+   if [ "${CONTRACT:0:2}" != "0x" ] ; then # if first 2 chars of $1 (contract name) don't start with "0x", fail
+      echo "Unexpected param. Expected contract address (0x...)"
+      exit 1
+   fi
+   
+   downloadSmartContract $CONTRACT $OUTPUT_FOLDER
+   graphSmartContract
 done
-
-cat << EOF >> test/POC.t.sol
-
-contract ${name}POC is Test {
-  ${name} c = ${name}($data_contract);
-
-  function test${name}POC() public {
-      vm.createSelectFork('${ETH_RPC_URL}');
-      assert(address(c) == $data_contract);
-  }
-}
-EOF
-
-# ===== GRAPHING =====
-
-mkdir assets
-
-LIST=$(find src -type f -name '*.sol') # glob expansion doesn't work here in Linux for some reason
-surya graph $LIST | dot -Tpng > assets/${name}-flow-graph.png
-sol2uml class -n mainnet -k $ETHERSCAN_API_KEY -o assets/${name}-UML.svg $logic_contract
-sol2uml storage -n mainnet -k $ETHERSCAN_API_KEY -o assets/${name}-storage.svg $logic_contract
-
-# ===== MISC =====
-
-echo "cd ${name}" | pbcopy 

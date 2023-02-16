@@ -75,7 +75,7 @@ downloadSmartContract () {
    done
 
    # run slither
-   slither . --checklist --exclude-low --exclude-medium --exclude naming-convention,solc-version,similar-names,name-reused > slither_checklist.md   
+   slither . --checklist --exclude-low --exclude-medium --exclude naming-convention,solc-version,similar-names,name-reused > ${name}_slither_checklist.md   
    
    touch test/${name}POC.t.sol
 
